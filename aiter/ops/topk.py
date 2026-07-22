@@ -348,7 +348,7 @@ def top_k_per_row_prefill(
     )
 
 
-@compile_ops("module_top_k_per_row", ffi_type="ctypes")
+@compile_ops("module_top_k_per_row_asm", ffi_type="ctypes")
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -396,7 +396,7 @@ def top_k_per_row_decode(
     )
 
 
-@compile_ops("module_top_k_per_row", ffi_type="ctypes")
+@compile_ops("module_top_k_per_row_asm", ffi_type="ctypes")
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
     next_n: int,
@@ -406,3 +406,94 @@ def top_k_per_row_decode_fast(
     stride0: int,
     stride1: int,
 ) -> None: ...
+
+
+# Runtime-K asm-fast variants (load *_with_topk.co; topK in {512, 1024, 2048}).
+# These ship gfx950 .co files, so they are the asm-fast top-k path on gfx950
+# where the base *_fast .co is not built.
+@compile_ops(
+    "module_top_k_per_row_asm",
+    fc_name="top_k_per_row_prefill_fast_with_topk",
+    ffi_type="ctypes",
+)
+def _top_k_per_row_prefill_fast_with_topk(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    topK: int,
+) -> None: ...
+
+
+def _topk_fast_workspace(topK: int, numRows: int, device: torch.device) -> torch.Tensor:
+    """Per-call scratch for the asm-fast runtime-K top-k kernels.
+
+    Allocated here (Python side, via the torch caching allocator) rather than
+    inside the kernel so the ctypes module stays torch-free. Using ``torch.empty``
+    keeps it cudagraph-capture-safe: capture-time blocks come from the graph
+    memory pool and are reused on replay (a raw hipMalloc inside a stream capture
+    is illegal). Size matches the C++ contract:
+    ``topK * (sizeof(float) + sizeof(int32_t)) * numRows`` bytes.
+    """
+    size = int(topK) * (4 + 4) * int(numRows)
+    return torch.empty(size, dtype=torch.uint8, device=device)
+
+
+def top_k_per_row_prefill_fast_with_topk(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: Optional[torch.Tensor],
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    topK: int,
+) -> None:
+    """Runtime-K asm-fast per-row top-k (prefill); topK in {512, 1024, 2048}."""
+    workspace = _topk_fast_workspace(topK, numRows, logits.device)
+    return _top_k_per_row_prefill_fast_with_topk(
+        logits, rowStarts, rowEnds, indices, values, workspace,
+        numRows, stride0, stride1, topK,
+    )
+
+
+@compile_ops(
+    "module_top_k_per_row_asm",
+    fc_name="top_k_per_row_decode_fast_with_topk",
+    ffi_type="ctypes",
+)
+def _top_k_per_row_decode_fast_with_topk(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    workspace: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    topK: int,
+) -> None: ...
+
+
+def top_k_per_row_decode_fast_with_topk(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    topK: int,
+) -> None:
+    """Runtime-K asm-fast per-row top-k (decode); topK in {512, 1024, 2048}."""
+    workspace = _topk_fast_workspace(topK, numRows, logits.device)
+    return _top_k_per_row_decode_fast_with_topk(
+        logits, next_n, seqLens, indices, workspace,
+        numRows, stride0, stride1, topK,
+    )
