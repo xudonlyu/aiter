@@ -435,6 +435,7 @@ struct pa_16mx8_32nx1_fp8_traits
     // `if constexpr (T::PAGED)` without a second traits concept.
     static constexpr bool PAGED   = false;
     static constexpr bool FUSED_Q = false;
+    static constexpr int  SGL_SCALE_SLOT   = 8;
     static constexpr int  SCALE_SLOT_BYTES = 0;
 };
 
@@ -483,7 +484,11 @@ struct pa_16mx8_32nx1_fp8_paged_traits
     static constexpr int SGL_ROW_BYTES = 576;
     static constexpr int SGL_NSCALE    = 7;
 
-    static constexpr int kv_buffer_load_insts = base::kv_buffer_load_insts + 1;
+    // +2 outstanding VMEM ops per tile against the flat pipeline: the
+    // global_load_lds of the 8-byte scale slots, and the index read that
+    // supplies its address.  Every `s_waitcnt vmcnt` in the pipeline is written
+    // as a function of this constant, so the accounting follows from here.
+    static constexpr int kv_buffer_load_insts = base::kv_buffer_load_insts + 2;
 
     static constexpr size_t smem_size_bytes()
     {
@@ -1255,6 +1260,7 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
     __builtin_amdgcn_s_barrier();
 
     pg = load_kv_page(1);
+
     global_load<T::VEC_KV>(p_kv + kv_token_offset(pg), s_kv[0].ptr, u_gkv, u_skv + kv_slot_offset);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[0] = load_kv_page(2);
@@ -2474,6 +2480,52 @@ __device__ inline auto make_layout_rk_mxscl(int lane_id) {
         opus::unfold_p_coord(rk_block_dim, opus::tuple{lane_id_n % T::smem_n_rpt, lane_id_n / T::smem_n_rpt, lane_id / T::W_N}));
 }
 
+// Read layout for the paged E8M0 slots.
+//
+// vLLM's fp8_ds_mla pool keeps SEVEN per-64 UE8M0 exponents per token in its
+// page tail, where a flat aiter row carries FOURTEEN per-32 ones inline.  A
+// per-64 exponent applies exactly to both of its per-32 halves -- identical
+// bytes, identical `exp+127` encoding -- so nothing is requantised: the slots
+// are copied verbatim into LDS and this layout folds the two per-32 block
+// indices of a pair onto the one byte they share.
+//
+// Same group structure as make_layout_rk_mxscl, so the register order is the
+// same v[e_n*4 + ek]; only the strides change.  For a lane the flat layout
+// selects block b = ek*4 + lane/16 at column 448+b; here it selects per-64
+// block b>>1 = ek*2 + (lane/16)>>1 at byte n*8 + (b>>1).
+//
+// Blocks 14 and 15 do not exist, and they land on byte 7 of the slot, which is
+// the pad byte vLLM zeroes.  That is also exactly where the caller's existing
+// `v_mxscl[3]/[7] = 0 for lane >= 32` fix-up applies, so the two agree.
+template<typename T>
+__device__ inline auto make_layout_rk_mxscl_paged(int lane_id) {
+    constexpr auto rk_block_shape = opus::make_tuple(
+        opus::number<T::smem_n_rpt>{},
+        opus::number<T::GEMM0_E_N>{},
+        opus::number<T::W_N / T::smem_n_rpt>{},
+        opus::number<2>{},
+        opus::number<T::GEMM0_NOPE_E_K>{});
+
+    constexpr auto rk_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    auto lane_id_n = lane_id % T::W_N;
+
+    return opus::make_layout(
+        rk_block_shape,
+        opus::unfold_x_stride(rk_block_dim, rk_block_shape,
+                              opus::tuple{opus::number<T::SGL_SCALE_SLOT>{},
+                                          opus::number<T::smem_n_rpt * T::SGL_SCALE_SLOT>{},
+                                          1_I,
+                                          2_I}),
+        opus::unfold_p_coord(rk_block_dim, opus::tuple{lane_id_n % T::smem_n_rpt,
+                                                       lane_id_n / T::smem_n_rpt,
+                                                       (lane_id / T::W_N) >> 1}));
+}
+
 template<typename T>
 __device__ inline auto make_layout_gk_rope(int lane_id) {
     constexpr int threads_d = T::D_128B_ROPE_SIZE / T::VEC_KV_ROPE;
@@ -2917,6 +2969,54 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         else                     return grid_row(token_idx) * kargs.stride_kv_rope_page;
     };
 
+    // ── Paged E8M0 slots ───────────────────────────────────────────────────
+    // The exponents are not in the row: they sit in the page's own scale tail,
+    // 8 B per token (7 real per-64 UE8M0 + 1 pad).  One tile's worth is 32x8 B
+    // = 256 B, which is exactly what a single `global_load_lds_dword` covers
+    // with 64 lanes, so the gather costs one instruction per wave per tile and
+    // rides the same vmcnt as the row copies -- which is why the paged traits
+    // carry `kv_buffer_load_insts + 1`.
+    char* const smem_scale = smem_kv + 4 * T::smem_kv_bytes();
+    const char* const kv_pool = reinterpret_cast<const char*>(kv_nope_ptr);
+    const int* const kv_idx_base = kv_indices + page_idx_begin;
+
+    // Byte offset of a token's scale slot.  Widened per factor: rows_per_page
+    // is a few hundred and the row stride 576, so the int product with a page
+    // index wraps well inside a real pool.
+    auto exp_off = [&](int token_idx) -> int64_t {
+        const int mask = (1 << grid.page_shift) - 1;
+        return static_cast<int64_t>(token_idx >> grid.page_shift)
+                   * static_cast<int64_t>(grid.rows_per_page)
+                   * static_cast<int64_t>(kargs.stride_kv_nope_page)
+             + static_cast<int64_t>(grid.scale_off)
+             + static_cast<int64_t>(token_idx & mask) * T::SGL_SCALE_SLOT;
+    };
+
+    // The index this lane's 4-byte piece of the copy belongs to: lane i writes
+    // LDS bytes [4i, 4i+4), i.e. the (i&1) half of row i>>1.  Rows past the
+    // segment fall back to row 0 -- a valid pool row whose scores are masked
+    // out anyway by attn_mask_oob_score.
+    auto load_scale_row = [&](int tile_idx) -> int {
+        if constexpr (!T::PAGED) { (void)tile_idx; return 0; }
+        else {
+            const int r = tile_idx * T::KV_TILE_SIZE + (lane_id >> 1);
+            return (r < valid_kv_len) ? kv_idx_base[r] : 0;
+        }
+    };
+
+    auto async_load_scale = [&](auto slot_n, int scale_row) {
+        if constexpr (T::PAGED) {
+            constexpr int sl = decltype(slot_n)::value;
+            const unsigned m0_val = __builtin_amdgcn_readfirstlane(static_cast<unsigned>(
+                reinterpret_cast<__UINTPTR_TYPE__>(smem_scale + sl * T::SCALE_SLOT_BYTES)));
+            const char* addr = kv_pool + exp_off(scale_row) + (lane_id & 1) * 4;
+            asm volatile("s_mov_b32 m0, %0\n\ts_nop 0\n\tglobal_load_lds_dword %1, off offset:0"
+                         :: "s"(m0_val), "v"(addr) : "memory");
+        } else {
+            (void)slot_n; (void)scale_row;
+        }
+    };
+
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& v_k_mxscl) {
         clear(s);
         auto& scale_k = reinterpret_cast<vector_t<int, T::GEMM0_E_N>&>(v_k_mxscl);
@@ -2970,8 +3070,10 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
+        const int kv_scale_row = load_scale_row(tile_idx);
         global_load<T::VEC_KV_NOPE>(p_k_nope + kv_nope_offset(kv_page), s_k_nope.ptr, u_gk_nope, u_sk_nope);
         global_load<T::VEC_KV_ROPE>(p_k_rope + kv_rope_offset(kv_page), s_k_rope.ptr, u_gk_rope, u_sk_rope);
+        async_load_scale(0_I, kv_scale_row);
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
@@ -3127,6 +3229,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
 
     // Tile traversal helpers
     int kv_page[2];
+    int scale_row_v[2];
     auto load_kv_page   = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     // Token id -> flat grid row.  Under PAGED the pool is a uniform
     // stride_kv_nope_page grid in which page p's token j is grid row
@@ -3159,14 +3262,73 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         else                     return grid_row(token_idx) * kargs.stride_kv_rope_page;
     };
 
+    // ── Paged E8M0 slots ───────────────────────────────────────────────────
+    // The exponents are not in the row: they sit in the page's own scale tail,
+    // 8 B per token (7 real per-64 UE8M0 + 1 pad).  One tile's worth is 32x8 B
+    // = 256 B, which is exactly what a single `global_load_lds_dword` covers
+    // with 64 lanes, so the gather costs one instruction per wave per tile and
+    // rides the same vmcnt as the row copies -- which is why the paged traits
+    // carry `kv_buffer_load_insts + 1`.
+    char* const smem_scale = smem_kv + 4 * T::smem_kv_bytes();
+    const char* const kv_pool = reinterpret_cast<const char*>(kv_nope_ptr);
+    const int* const kv_idx_base = kv_indices + page_idx_begin;
+
+    // Byte offset of a token's scale slot.  Widened per factor: rows_per_page
+    // is a few hundred and the row stride 576, so the int product with a page
+    // index wraps well inside a real pool.
+    auto exp_off = [&](int token_idx) -> int64_t {
+        const int mask = (1 << grid.page_shift) - 1;
+        return static_cast<int64_t>(token_idx >> grid.page_shift)
+                   * static_cast<int64_t>(grid.rows_per_page)
+                   * static_cast<int64_t>(kargs.stride_kv_nope_page)
+             + static_cast<int64_t>(grid.scale_off)
+             + static_cast<int64_t>(token_idx & mask) * T::SGL_SCALE_SLOT;
+    };
+
+    // The index this lane's 4-byte piece of the copy belongs to: lane i writes
+    // LDS bytes [4i, 4i+4), i.e. the (i&1) half of row i>>1.  Rows past the
+    // segment fall back to row 0 -- a valid pool row whose scores are masked
+    // out anyway by attn_mask_oob_score.
+    auto load_scale_row = [&](int tile_idx) -> int {
+        if constexpr (!T::PAGED) { (void)tile_idx; return 0; }
+        else {
+            const int r = tile_idx * T::KV_TILE_SIZE + (lane_id >> 1);
+            return (r < valid_kv_len) ? kv_idx_base[r] : 0;
+        }
+    };
+
+    auto async_load_scale = [&](auto slot_n, int scale_row) {
+        if constexpr (T::PAGED) {
+            constexpr int sl = decltype(slot_n)::value;
+            const unsigned m0_val = __builtin_amdgcn_readfirstlane(static_cast<unsigned>(
+                reinterpret_cast<__UINTPTR_TYPE__>(smem_scale + sl * T::SCALE_SLOT_BYTES)));
+            const char* addr = kv_pool + exp_off(scale_row) + (lane_id & 1) * 4;
+            asm volatile("s_mov_b32 m0, %0\n\ts_nop 0\n\tglobal_load_lds_dword %1, off offset:0"
+                         :: "s"(m0_val), "v"(addr) : "memory");
+        } else {
+            (void)slot_n; (void)scale_row;
+        }
+    };
+
     auto async_load_kv = [&](auto slot_n, int token_idx) {
         constexpr int sl = decltype(slot_n)::value;
         global_load<T::VEC_KV_NOPE>(p_k_nope + kv_nope_offset(token_idx), s_k_nope.ptr, u_gk_nope, u_sk_nope + number<sl * (T::smem_kv_bytes() / sizeof(D_NOPE))>{});
         global_load<T::VEC_KV_ROPE>(p_k_rope + kv_rope_offset(token_idx), s_k_rope.ptr, u_gk_rope, u_sk_rope + number<sl * (T::smem_kv_bytes() / sizeof(D_ROPE))>{});
     };
 
+    auto s_scale_tile     = make_smem(reinterpret_cast<D_NOPE*>(smem_scale));
+    auto u_rk_mxscl_paged = make_layout_rk_mxscl_paged<T>(lane_id);
     auto load_mxscl = [&](auto slot_off) {
-        auto v_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}) + slot_off);
+        // Under PAGED the exponents never enter the KV tile at all, so the read
+        // moves to the scale region; the lane>=32 fix-up is unchanged, and it
+        // lands on the same non-existent blocks 14/15 either way.
+        constexpr int sl = (decltype(slot_off)::value == 0) ? 0 : 1;
+        auto v_mxscl = [&] {
+            if constexpr (T::PAGED)
+                return load<1>(s_scale_tile, u_rk_mxscl_paged + number<sl * T::SCALE_SLOT_BYTES>{});
+            else
+                return load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}) + slot_off);
+        }();
         if (lane_id >= 32) {
             v_mxscl[3] = static_cast<D_NOPE>(0);
             v_mxscl[7] = static_cast<D_NOPE>(0);
@@ -3257,15 +3419,21 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
 
     // Prologue
     int pg = load_kv_page(0);
+    int sr = load_scale_row(0);
     async_load_kv(0_I, pg);
+    async_load_scale(0_I, sr);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     pg = load_kv_page(1);
+
+    sr = load_scale_row(1);
     async_load_kv(1_I, pg);
+    async_load_scale(1_I, sr);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[0] = load_kv_page(2);
+    scale_row_v[0] = load_scale_row(2);
     v_k_mxscl = load_mxscl(0_I);
     v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
     v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
@@ -3309,7 +3477,9 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
         async_load_kv(0_I, kv_page[0]);
+        async_load_scale(0_I, scale_row_v[0]);
         kv_page[1] = load_kv_page(j + 2);
+        scale_row_v[1] = load_scale_row(j + 2);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -3372,7 +3542,9 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
         async_load_kv(1_I, kv_page[1]);
+        async_load_scale(1_I, scale_row_v[1]);
         kv_page[0] = load_kv_page(j + 3);
+        scale_row_v[0] = load_scale_row(j + 3);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -3438,6 +3610,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
         async_load_kv(0_I, kv_page[0]);
+        async_load_scale(0_I, scale_row_v[0]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -3568,7 +3741,9 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + k_nope_slot_off + sk_nope_slice(1_I));
         async_load_kv(0_I, kv_page[0]);
+        async_load_scale(0_I, scale_row_v[0]);
         kv_page[1] = load_kv_page(num_kv_tiles - 1);
+        scale_row_v[1] = load_scale_row(num_kv_tiles - 1);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -3625,6 +3800,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
         async_load_kv(1_I, kv_page[1]);
+        async_load_scale(1_I, scale_row_v[1]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         __builtin_amdgcn_sched_barrier(0);
