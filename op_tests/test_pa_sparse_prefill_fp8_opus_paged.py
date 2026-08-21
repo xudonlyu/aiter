@@ -29,6 +29,15 @@ NSCALE = D_NOPE // QBLK          # 7
 FP8_MAX = 448.0
 
 
+def _skip_if_unsupported() -> bool:
+    if not torch.cuda.is_available():
+        print("SKIP: no CUDA/HIP device"); return True
+    arch = str(getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")).split(":")[0]
+    if arch != "gfx950":
+        print(f"SKIP: needs gfx950, found {arch}"); return True
+    return False
+
+
 def quant_per64(x):
     """vLLM's quantize_and_insert_k_kernel, verbatim: UE8M0, stored exp+127."""
     r = x.shape[0]

@@ -582,6 +582,19 @@
         "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_moe/gen_instances.py --working_path {{0}}'"
     },
+    "module_dsv4_mla_prefill_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/dsv4_mla_prefill_opus.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "md_name": "'module_dsv4_mla_prefill_opus'",
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include'"
+        ],
+        "verbose": "False"
+    },
     "module_pa_sparse_prefill_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_sparse_prefill_opus_kernels.cu'",
