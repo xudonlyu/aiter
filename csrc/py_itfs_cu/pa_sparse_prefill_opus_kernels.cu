@@ -387,8 +387,11 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
                     "kv_indptr length must be N+1");
     }
 
-    AITER_CHECK(q_nope.stride(2) == 1 && q_nope.stride(1) == Traits::D_NOPE_SIZE,
-                "q_nope must be contiguous with row stride 448");
+    // Only the head dim has to be unit-stride: the row stride travels in kargs,
+    // so a [..., :448] slice of a wider bf16 Q -- which is exactly what vLLM
+    // hands over -- needs no copy.  Requiring stride(1) == 448 here would force
+    // a .contiguous() worth ~15% of the call.
+    AITER_CHECK(q_nope.stride(2) == 1, "q_nope must be unit-stride along the head dim");
     AITER_CHECK(q_rope.stride(2) == 1 && q_rope.stride(1) == D_ROPE,
                 "q_rope must be contiguous with row stride 64");
     AITER_CHECK(out.stride(2) == 1, "out must be contiguous along the head dim");

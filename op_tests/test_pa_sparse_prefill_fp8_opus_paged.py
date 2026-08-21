@@ -130,7 +130,10 @@ def run(T, H, rows, plen, elen, page_size, seed):
     q_nope = pack_q(q[..., :D_NOPE].reshape(-1, D_NOPE)).reshape(T, H, D_PAD)
     q_rope = q[..., D_NOPE:].contiguous()
 
-    q_nope_bf16 = q[..., :D_NOPE].contiguous()      # the kernel packs this itself
+    # A [..., :448] slice of the [T, H, 512] Q, row stride 512 -- this is what
+    # vLLM hands over, and requiring a contiguous 448 here would force a copy.
+    q_nope_bf16 = q[..., :D_NOPE]
+    assert q_nope_bf16.stride(1) == D, "the sliced-Q case must keep the wide row stride"
     args = (q_nope_bf16, q_rope, nope_view, rope_view, p_ix.reshape(-1), p_ip,
             nope_view, rope_view, e_ix.reshape(-1), e_ip, sink, scale,
             geom["page_shift"], geom["rows_per_page"], geom["scale_off"],

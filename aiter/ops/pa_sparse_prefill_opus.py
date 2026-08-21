@@ -372,7 +372,9 @@ def pa_sparse_prefill_fp8_opus_paged(
 
     Args:
       q_nope:            ``[N, H, 448]`` **bf16** -- the kernel packs it in its
-        prologue, one E8M0 per head, so there is no separate pack pass.  A
+        prologue, one E8M0 per head, so there is no separate pack pass.  Only
+        the head dim has to be unit-stride, so a ``[..., :448]`` slice of a
+        wider Q needs no copy.  A
         standalone pack runs at bandwidth (33 us at T=1024 H=128, 279 us at
         T=8192) and cannot be tuned, so the only way to remove it is not to
         materialise a packed Q at all.  Per head rather than per 32 because the
