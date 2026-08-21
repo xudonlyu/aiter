@@ -55,6 +55,51 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
 //   attn_sink          : [H] fp32 (per-head softmax-denominator bias)
 //   out                : [N, H, 512] bf16 (caller-allocated)
 // `softmax_scale` is forwarded to the kernel as-is (no implicit 1/sqrt(D)).
+// Public API: paged split-precision prefill for DeepSeek-V4 DSA on gfx950.
+//
+// Same kernel as `pa_sparse_prefill_fp8_opus_fwd`, but the KV streams are read
+// straight out of vLLM's `fp8_ds_mla` paged pool instead of a flat array, which
+// removes the dequantise-and-gather pass that would otherwise stage them.
+//
+// Each pool row is 576 B -- 448 NoPE fp8 followed by 64 RoPE bf16 -- and the
+// exponents are NOT in the row: each page carries a tail of 8 B per token,
+// holding 7 per-64 UE8M0 block scales plus a pad byte.  A per-64 exponent
+// applies exactly to both of its per-32 halves, so the kernel consumes them
+// unchanged and nothing has to be requantised, rewritten, or pre-passed.
+//
+//   unified_kv_nope / kv_nope : [rows, 512] fp8, row stride 576  (a strided
+//                               view of the pool; the last 64 columns overlap
+//                               the row's RoPE half and are never used)
+//   unified_kv_rope / kv_rope : [rows, 64]  bf16, row stride 288 (the same
+//                               pool, based at byte 448 of row 0)
+//   page_shift                : page_size == 1 << page_shift
+//   rows_per_page             : bytes_per_page / 576
+//   scale_off                 : byte offset of the page's scale tail
+//
+// The prefix and extend segments may sit in different pools with different page
+// sizes, so the three descriptors are per segment.  There is no flat fallback:
+// a flat row carries 14 per-32 exponents inline, which is a different layout
+// rather than a degenerate case of this one, so `page_shift == 0` is rejected.
+void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
+                                          aiter_tensor_t& q_rope,
+                                          aiter_tensor_t& unified_kv_nope,
+                                          aiter_tensor_t& unified_kv_rope,
+                                          aiter_tensor_t& kv_indices_prefix,
+                                          aiter_tensor_t& kv_indptr_prefix,
+                                          aiter_tensor_t& kv_nope,
+                                          aiter_tensor_t& kv_rope,
+                                          aiter_tensor_t& kv_indices_extend,
+                                          aiter_tensor_t& kv_indptr_extend,
+                                          aiter_tensor_t& attn_sink,
+                                          aiter_tensor_t& out,
+                                          float softmax_scale,
+                                          int page_shift_prefix,
+                                          int rows_per_page_prefix,
+                                          int scale_off_prefix,
+                                          int page_shift_extend,
+                                          int rows_per_page_extend,
+                                          int scale_off_extend);
+
 void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
                                     aiter_tensor_t& q_rope,
                                     aiter_tensor_t& unified_kv_nope,
@@ -3077,6 +3122,9 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
+    auto s_scale_tile     = make_smem(reinterpret_cast<D_NOPE*>(smem_scale));
+    auto u_rk_mxscl_paged = make_layout_rk_mxscl_paged<T>(lane_id);
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
         const int kv_scale_row = load_scale_row(tile_idx);
@@ -3088,7 +3136,16 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
         constexpr int mxscl_chunk = T::D_NOPE_SIZE / T::D_128B_NOPE_SIZE;
         constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
-        auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}));
+        // Under PAGED the exponents live in the scale region, not in the tile:
+        // bytes 448..461 of a pool row are RoPE bf16, and reading them here as
+        // E8M0 is silent garbage rather than a fault.  This is the pipelined
+        // path's load_mxscl, inlined -- keep the two in step.
+        auto v_k_mxscl = [&] {
+            if constexpr (T::PAGED)
+                return load<1>(s_scale_tile, u_rk_mxscl_paged);
+            else
+                return load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}));
+        }();
         v_k_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[3];
         v_k_mxscl[7] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[7];
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);

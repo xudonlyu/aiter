@@ -1498,7 +1498,28 @@ namespace py = pybind11;
           py::arg("kv_indptr_extend"),      \
           py::arg("attn_sink"),             \
           py::arg("out"),                   \
-          py::arg("softmax_scale"));
+          py::arg("softmax_scale"));        \
+    m.def("pa_sparse_prefill_fp8_opus_paged_fwd",     \
+          &pa_sparse_prefill_fp8_opus_paged_fwd,      \
+          py::arg("q_nope"),                \
+          py::arg("q_rope"),                \
+          py::arg("unified_kv_nope"),       \
+          py::arg("unified_kv_rope"),       \
+          py::arg("kv_indices_prefix"),     \
+          py::arg("kv_indptr_prefix"),      \
+          py::arg("kv_nope"),               \
+          py::arg("kv_rope"),               \
+          py::arg("kv_indices_extend"),     \
+          py::arg("kv_indptr_extend"),      \
+          py::arg("attn_sink"),             \
+          py::arg("out"),                   \
+          py::arg("softmax_scale"),         \
+          py::arg("page_shift_prefix"),     \
+          py::arg("rows_per_page_prefix"),  \
+          py::arg("scale_off_prefix"),      \
+          py::arg("page_shift_extend"),     \
+          py::arg("rows_per_page_extend"),  \
+          py::arg("scale_off_extend"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
     m.def("fmha_fwd_bf16_opus_fwd",                 \
