@@ -114,13 +114,6 @@ else:
     from .ops.moe_mxfp4_aux import *
     from .ops.pa_sparse_prefill_opus import *
 
-    # Prebuilt-code-object build of the DSv4 MLA paged sparse prefill.  Same
-    # kernel as pa_sparse_prefill_fp8_opus_paged above, under its own name --
-    # import one or the other, never both.
-    from .ops.dsv4_mla_prefill_opus import (  # noqa: F401
-        DSV4_MLA_PREFILL_OPUS_MIN_H,
-        dsv4_mla_prefill_opus,
-    )
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.rmsnorm import *
