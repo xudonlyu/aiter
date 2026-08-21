@@ -98,7 +98,11 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
                                           int scale_off_prefix,
                                           int page_shift_extend,
                                           int rows_per_page_extend,
-                                          int scale_off_extend);
+                                          int scale_off_extend,
+                                          aiter_tensor_t& kv_lens_prefix,
+                                          aiter_tensor_t& kv_lens_extend,
+                                          int kv_stride_q_prefix,
+                                          int kv_stride_q_extend);
 
 void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
                                     aiter_tensor_t& q_rope,
@@ -4178,9 +4182,24 @@ __device__ inline void pa_prefill_16mx8_32nx1_fp8_body(KArgs kargs) {
 
     // ──── Prefix segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
-        const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        // Two index forms.  CSR (indptr + concatenated indices) is aiter's own;
+        // vLLM hands out a dense [N, topk] array plus per-token lengths, and
+        // building CSR from that on every call is a pass this kernel does not
+        // need.  Only the two scalars below differ -- the gather itself is
+        // identical -- and the branch is wave-uniform, so it costs nothing.
+        int page_idx_begin, valid_kv_len;
+        if constexpr (T::PAGED) {
+            if (kargs.kv_lens_prefix != nullptr) {
+                page_idx_begin = q_token_idx * kargs.kv_stride_q_prefix;
+                valid_kv_len   = kargs.kv_lens_prefix[q_token_idx];
+            } else {
+                page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+                valid_kv_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - page_idx_begin;
+            }
+        } else {
+            page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+            valid_kv_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - page_idx_begin;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
@@ -4213,9 +4232,24 @@ __device__ inline void pa_prefill_16mx8_32nx1_fp8_body(KArgs kargs) {
 
     // ──── Extend segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
-        const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        // Two index forms.  CSR (indptr + concatenated indices) is aiter's own;
+        // vLLM hands out a dense [N, topk] array plus per-token lengths, and
+        // building CSR from that on every call is a pass this kernel does not
+        // need.  Only the two scalars below differ -- the gather itself is
+        // identical -- and the branch is wave-uniform, so it costs nothing.
+        int page_idx_begin, valid_kv_len;
+        if constexpr (T::PAGED) {
+            if (kargs.kv_lens_extend != nullptr) {
+                page_idx_begin = q_token_idx * kargs.kv_stride_q_extend;
+                valid_kv_len   = kargs.kv_lens_extend[q_token_idx];
+            } else {
+                page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+                valid_kv_len   = kargs.kv_indptr_extend[q_token_idx + 1] - page_idx_begin;
+            }
+        } else {
+            page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+            valid_kv_len   = kargs.kv_indptr_extend[q_token_idx + 1] - page_idx_begin;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {

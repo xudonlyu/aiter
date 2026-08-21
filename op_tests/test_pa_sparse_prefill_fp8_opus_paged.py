@@ -122,11 +122,19 @@ def run(T, H, rows, plen, elen, page_size, seed):
     q_rope = q[..., D_NOPE:].contiguous()
 
     q_nope_bf16 = q[..., :D_NOPE].contiguous()      # the kernel packs this itself
-    out_paged = pa_sparse_prefill_fp8_opus_paged(
-        q_nope_bf16, q_rope, nope_view, rope_view, p_ix.reshape(-1), p_ip,
-        nope_view, rope_view, e_ix.reshape(-1), e_ip, sink, scale,
-        geom["page_shift"], geom["rows_per_page"], geom["scale_off"],
-        geom["page_shift"], geom["rows_per_page"], geom["scale_off"])
+    args = (q_nope_bf16, q_rope, nope_view, rope_view, p_ix.reshape(-1), p_ip,
+            nope_view, rope_view, e_ix.reshape(-1), e_ip, sink, scale,
+            geom["page_shift"], geom["rows_per_page"], geom["scale_off"],
+            geom["page_shift"], geom["rows_per_page"], geom["scale_off"])
+    out_paged = pa_sparse_prefill_fp8_opus_paged(*args)
+
+    # The dense form: the same indices read as [T, topk] + lengths, which is the
+    # shape vLLM already has.  It must agree with CSR bit for bit.
+    p_len = torch.full((T,), plen, dtype=torch.int32, device=dev)
+    e_len = torch.full((T,), elen, dtype=torch.int32, device=dev)
+    out_dense = pa_sparse_prefill_fp8_opus_paged(
+        *args, kv_lens_prefix=p_len, kv_lens_extend=e_len,
+        kv_stride_q_prefix=plen, kv_stride_q_extend=elen)
 
     out_flat = pa_sparse_prefill_fp8_opus(
         q_nope, q_rope, flat_nope, rope, p_ix.reshape(-1), p_ip,
@@ -148,6 +156,7 @@ def run(T, H, rows, plen, elen, page_size, seed):
 
     nf = int((~torch.isfinite(out_paged)).sum())
     return dict(nonfinite=nf,
+                dense_eq=bool(torch.equal(out_paged, out_dense)),
                 paged_vs_flat=rel_l2(out_paged, out_flat),
                 exact=bool(torch.equal(out_paged, out_flat)),
                 paged_vs_triton=rel_l2(out_paged, out_tri),
@@ -164,7 +173,7 @@ def main():
              ("H=192", 256, 192, 128, 256), ("empty-extend", 512, 128, 256, 0)]
     print(f"page_size={a.page_size}  gpu={torch.cuda.get_device_name()}")
     print(f"{'case':14}{'T':>6}{'H':>5}{'rows/tok':>9}{'nonfin':>8}"
-          f"{'paged vs flat':>15}{'exact':>7}{'paged vs triton':>17}{'flat vs triton':>16}"
+          f"{'paged vs flat':>15}{'dense==csr':>12}{'paged vs triton':>17}{'flat vs triton':>16}"
           f"{'vs triton(deq)':>16}")
     bad = 0
     for name, T, H, plen, elen in cases:
@@ -173,12 +182,12 @@ def main():
         else:
             r = run(T, H, 8192, plen, elen, a.page_size, 20260821)
         # the bar is Triton: the fused Q pack must not move the fp8 cost
-        flag = ("" if (r["nonfinite"] == 0
+        flag = ("" if (r["nonfinite"] == 0 and r["dense_eq"]
                        and abs(r["paged_vs_triton"] - r["flat_vs_triton"]) < 2e-3)
                 else "   <-- FAIL")
         if flag: bad += 1
         print(f"{name:14}{T:>6}{H:>5}{plen+elen:>9}{r['nonfinite']:>8}"
-              f"{r['paged_vs_flat']:>15.3e}{str(r['exact']):>7}{r['paged_vs_triton']:>17.3e}"
+              f"{r['paged_vs_flat']:>15.3e}{str(r['dense_eq']):>12}{r['paged_vs_triton']:>17.3e}"
               f"{r['flat_vs_triton']:>16.3e}{r['paged_vs_triton_deq']:>16.3e}{flag}", flush=True)
     print("\nFAILURES:" if bad else "\nall cases within 2e-3 of the flat arm against Triton", bad or "")
 

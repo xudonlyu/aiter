@@ -262,6 +262,11 @@ def pa_sparse_prefill_fp8_opus(
     return out
 
 
+def _empty_i32(like: torch.Tensor) -> torch.Tensor:
+    """Sentinel for an omitted optional tensor argument (numel 0 == not given)."""
+    return torch.empty(0, dtype=torch.int32, device=like.device)
+
+
 @compile_ops("module_pa_sparse_prefill_opus", develop=True)
 def pa_sparse_prefill_fp8_opus_paged_fwd(
     q_nope: torch.Tensor,
@@ -283,6 +288,10 @@ def pa_sparse_prefill_fp8_opus_paged_fwd(
     page_shift_extend: int,
     rows_per_page_extend: int,
     scale_off_extend: int,
+    kv_lens_prefix: torch.Tensor,
+    kv_lens_extend: torch.Tensor,
+    kv_stride_q_prefix: int,
+    kv_stride_q_extend: int,
 ) -> None: ...
 
 
@@ -306,6 +315,10 @@ def _pa_sparse_prefill_fp8_opus_paged_fake(
     rows_per_page_extend: int,
     scale_off_extend: int,
     out: torch.Tensor | None = None,
+    kv_lens_prefix: torch.Tensor | None = None,
+    kv_lens_extend: torch.Tensor | None = None,
+    kv_stride_q_prefix: int = 0,
+    kv_stride_q_extend: int = 0,
 ) -> torch.Tensor:
     if out is not None:
         return out
@@ -336,6 +349,10 @@ def pa_sparse_prefill_fp8_opus_paged(
     rows_per_page_extend: int,
     scale_off_extend: int,
     out: torch.Tensor | None = None,
+    kv_lens_prefix: torch.Tensor | None = None,
+    kv_lens_extend: torch.Tensor | None = None,
+    kv_stride_q_prefix: int = 0,
+    kv_stride_q_extend: int = 0,
 ) -> torch.Tensor:
     """Sparse prefill attention reading vLLM's ``fp8_ds_mla`` paged pool directly.
 
@@ -376,6 +393,12 @@ def pa_sparse_prefill_fp8_opus_paged(
       rows_per_page_*:   ``bytes_per_page / 576``.
       scale_off_*:       byte offset of the page's scale tail.
       out:               optional ``[N, H, 512]`` bf16 buffer.
+      kv_lens_*:         optional ``[N]`` int32 per-token lengths.  Supplying
+        them selects the **dense** index form -- ``kv_indices_*`` is then read as
+        a ``[N, kv_stride_q_*]`` array and ``kv_indptr_*`` is ignored -- which is
+        the shape vLLM already has, so no CSR has to be built per call.  Both
+        segments must use the same form.
+      kv_stride_q_*:     row stride of the dense index array.
 
     The prefix and extend segments may live in different pools with different
     page sizes, hence one descriptor each.
@@ -434,6 +457,10 @@ def pa_sparse_prefill_fp8_opus_paged(
         int(page_shift_extend),
         int(rows_per_page_extend),
         int(scale_off_extend),
+        _empty_i32(q_nope) if kv_lens_prefix is None else kv_lens_prefix,
+        _empty_i32(q_nope) if kv_lens_extend is None else kv_lens_extend,
+        int(kv_stride_q_prefix),
+        int(kv_stride_q_extend),
     )
     return out
 

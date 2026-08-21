@@ -299,7 +299,11 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
                                           int scale_off_prefix,
                                           int page_shift_extend,
                                           int rows_per_page_extend,
-                                          int scale_off_extend)
+                                          int scale_off_extend,
+                                          aiter_tensor_t& kv_lens_prefix,
+                                          aiter_tensor_t& kv_lens_extend,
+                                          int kv_stride_q_prefix,
+                                          int kv_stride_q_extend)
 {
     using Traits = pa_16mx8_32nx1_fp8_paged_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>;
     constexpr int D_NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE; // 512
@@ -355,8 +359,33 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
     AITER_CHECK(out.size(0) == N && out.size(1) == H && out.size(2) == D_HEAD,
                 "out shape must be [N, H, 512]");
     AITER_CHECK(attn_sink.size(0) == H, "attn_sink length must equal H");
-    AITER_CHECK(kv_indptr_prefix.size(0) == N + 1 && kv_indptr_extend.size(0) == N + 1,
-                "kv_indptr length must be N+1");
+    // Dense form when lengths are supplied, CSR when they are not.  Both
+    // segments must agree: mixing them would leave kv_stride_q meaningless for
+    // one of the two.
+    const bool dense_p = kv_lens_prefix.numel() > 0;
+    const bool dense_e = kv_lens_extend.numel() > 0;
+    AITER_CHECK(dense_p == dense_e,
+                "kv_lens_prefix and kv_lens_extend must both be given or both omitted");
+    if(dense_p)
+    {
+        AITER_CHECK(kv_lens_prefix.dtype() == AITER_DTYPE_i32 &&
+                        kv_lens_extend.dtype() == AITER_DTYPE_i32,
+                    "kv_lens must be int32");
+        AITER_CHECK(kv_lens_prefix.numel() == N && kv_lens_extend.numel() == N,
+                    "kv_lens must have one entry per query token");
+        AITER_CHECK(kv_lens_prefix.is_contiguous() && kv_lens_extend.is_contiguous(),
+                    "kv_lens must be contiguous");
+        AITER_CHECK(kv_stride_q_prefix > 0 && kv_stride_q_extend > 0,
+                    "the dense form needs a positive row stride for the index array");
+        AITER_CHECK(kv_indices_prefix.numel() >= (int64_t)N * kv_stride_q_prefix &&
+                        kv_indices_extend.numel() >= (int64_t)N * kv_stride_q_extend,
+                    "the dense index array is shorter than N * kv_stride_q");
+    }
+    else
+    {
+        AITER_CHECK(kv_indptr_prefix.size(0) == N + 1 && kv_indptr_extend.size(0) == N + 1,
+                    "kv_indptr length must be N+1");
+    }
 
     AITER_CHECK(q_nope.stride(2) == 1 && q_nope.stride(1) == Traits::D_NOPE_SIZE,
                 "q_nope must be contiguous with row stride 448");
@@ -442,8 +471,12 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
     kargs.kv_indices_prefix   = reinterpret_cast<const int*>(kv_indices_prefix.data_ptr());
     kargs.kv_indptr_extend    = reinterpret_cast<const int*>(kv_indptr_extend.data_ptr());
     kargs.kv_indices_extend   = reinterpret_cast<const int*>(kv_indices_extend.data_ptr());
-    kargs.kv_lens_prefix      = nullptr;   // dense index form is not wired yet
-    kargs.kv_lens_extend      = nullptr;
+    kargs.kv_lens_prefix = dense_p
+                               ? reinterpret_cast<const int*>(kv_lens_prefix.data_ptr())
+                               : nullptr;
+    kargs.kv_lens_extend = dense_e
+                               ? reinterpret_cast<const int*>(kv_lens_extend.data_ptr())
+                               : nullptr;
     kargs.N                   = N;
     kargs.H                   = H;
     kargs.total_pages         = static_cast<int>(rows[0]);
@@ -456,8 +489,8 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
     kargs.stride_o_h          = static_cast<int>(out.stride(1));
     kargs.stride_kv_nope_page = stride_kv_nope_page;
     kargs.stride_kv_rope_page = stride_kv_rope_page;
-    kargs.kv_stride_q_prefix  = 0;
-    kargs.kv_stride_q_extend  = 0;
+    kargs.kv_stride_q_prefix  = kv_stride_q_prefix;
+    kargs.kv_stride_q_extend  = kv_stride_q_extend;
     kargs.softmax_scale       = softmax_scale;
 
     // ---- Launch ------------------------------------------------------------
