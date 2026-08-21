@@ -309,7 +309,7 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
     constexpr int SCALE_SLOT    = Traits::SGL_SCALE_SLOT;     // 8
 
     // ---- Shape / dtype validation -----------------------------------------
-    AITER_CHECK(q_nope.dim() == 3, "q_nope must be 3-D [N, H, 512], got ndim=", q_nope.dim());
+    AITER_CHECK(q_nope.dim() == 3, "q_nope must be 3-D [N, H, 448], got ndim=", q_nope.dim());
     AITER_CHECK(q_rope.dim() == 3, "q_rope must be 3-D [N, H, 64], got ndim=", q_rope.dim());
     AITER_CHECK(unified_kv_nope.dim() == 2 && kv_nope.dim() == 2,
                 "unified_kv_nope / kv_nope must be 2-D [rows, 512] views of the pool");
@@ -318,9 +318,12 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
     AITER_CHECK(out.dim() == 3, "out must be 3-D [N, H, 512], got ndim=", out.dim());
     AITER_CHECK(attn_sink.dim() == 1, "attn_sink must be 1-D [H]");
 
-    AITER_CHECK(q_nope.dtype() == AITER_DTYPE_fp8 && unified_kv_nope.dtype() == AITER_DTYPE_fp8 &&
-                    kv_nope.dtype() == AITER_DTYPE_fp8,
-                "q_nope/unified_kv_nope/kv_nope must be fp8");
+    // Q is bf16 while the KV streams are fp8 -- the two differ on purpose,
+    // because the kernel packs Q itself in its prologue.
+    AITER_CHECK(q_nope.dtype() == AITER_DTYPE_bf16,
+                "q_nope must be bf16 [N, H, 448]; this kernel packs it");
+    AITER_CHECK(unified_kv_nope.dtype() == AITER_DTYPE_fp8 && kv_nope.dtype() == AITER_DTYPE_fp8,
+                "unified_kv_nope/kv_nope must be fp8");
     AITER_CHECK(q_rope.dtype() == AITER_DTYPE_bf16 && unified_kv_rope.dtype() == AITER_DTYPE_bf16 &&
                     kv_rope.dtype() == AITER_DTYPE_bf16,
                 "q_rope/unified_kv_rope/kv_rope must be bf16");
@@ -342,7 +345,7 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
                 "the paged fp8 prefill is only compiled for H > 32 (T_M=8), got H=", H,
                 "; route narrower head counts to pa_sparse_prefill_fp8_opus_fwd");
 
-    AITER_CHECK(q_nope.size(2) == D_NOPE_PADDED, "q_nope last dim must be 512");
+    AITER_CHECK(q_nope.size(2) == Traits::D_NOPE_SIZE, "q_nope last dim must be 448");
     AITER_CHECK(q_rope.size(0) == N && q_rope.size(1) == H && q_rope.size(2) == D_ROPE,
                 "q_rope shape must be [N, H, 64]");
     AITER_CHECK(unified_kv_nope.size(1) == D_NOPE_PADDED && kv_nope.size(1) == D_NOPE_PADDED,
@@ -355,8 +358,8 @@ void pa_sparse_prefill_fp8_opus_paged_fwd(aiter_tensor_t& q_nope,
     AITER_CHECK(kv_indptr_prefix.size(0) == N + 1 && kv_indptr_extend.size(0) == N + 1,
                 "kv_indptr length must be N+1");
 
-    AITER_CHECK(q_nope.stride(2) == 1 && q_nope.stride(1) == D_NOPE_PADDED,
-                "q_nope must be contiguous with row stride 512");
+    AITER_CHECK(q_nope.stride(2) == 1 && q_nope.stride(1) == Traits::D_NOPE_SIZE,
+                "q_nope must be contiguous with row stride 448");
     AITER_CHECK(q_rope.stride(2) == 1 && q_rope.stride(1) == D_ROPE,
                 "q_rope must be contiguous with row stride 64");
     AITER_CHECK(out.stride(2) == 1, "out must be contiguous along the head dim");

@@ -7,12 +7,14 @@ same data:
 
   triton   vLLM's Triton sparse prefill on the *unquantised* bf16 KV
   flat     aiter's existing flat fp8 opus op, fed the same fp8 bytes with each
-           per-64 exponent duplicated into its two per-32 slots
-  paged    the new op, reading the pool directly
+           per-64 exponent duplicated into its two per-32 slots, and a Q
+           pre-packed per 32
+  paged    the new op: reads the pool directly and packs Q itself, per head
 
-`paged` vs `flat` isolates the paged read itself: the two see identical
-numbers, so any difference is an addressing bug.  `paged` vs `triton` is the
-honest fp8 cost.
+The two arms now see identical KV but differently quantised Q -- per head
+against per 32 -- so `paged vs flat` is no longer expected to be zero.  It
+measures exactly what the coarser Q exponent costs; `paged vs triton` next to
+`flat vs triton` says whether that shows up at all against the fp8 floor.
 """
 import argparse, math, statistics
 import torch
@@ -119,8 +121,9 @@ def run(T, H, rows, plen, elen, page_size, seed):
     q_nope = pack_q(q[..., :D_NOPE].reshape(-1, D_NOPE)).reshape(T, H, D_PAD)
     q_rope = q[..., D_NOPE:].contiguous()
 
+    q_nope_bf16 = q[..., :D_NOPE].contiguous()      # the kernel packs this itself
     out_paged = pa_sparse_prefill_fp8_opus_paged(
-        q_nope, q_rope, nope_view, rope_view, p_ix.reshape(-1), p_ip,
+        q_nope_bf16, q_rope, nope_view, rope_view, p_ix.reshape(-1), p_ip,
         nope_view, rope_view, e_ix.reshape(-1), e_ip, sink, scale,
         geom["page_shift"], geom["rows_per_page"], geom["scale_off"],
         geom["page_shift"], geom["rows_per_page"], geom["scale_off"])
@@ -169,12 +172,15 @@ def main():
             r = run(T, H, 8192, plen, 1, a.page_size, 20260821)   # 1 = minimal extend
         else:
             r = run(T, H, 8192, plen, elen, a.page_size, 20260821)
-        flag = "" if (r["nonfinite"] == 0 and r["paged_vs_flat"] < 1e-6) else "   <-- FAIL"
+        # the bar is Triton: the fused Q pack must not move the fp8 cost
+        flag = ("" if (r["nonfinite"] == 0
+                       and abs(r["paged_vs_triton"] - r["flat_vs_triton"]) < 2e-3)
+                else "   <-- FAIL")
         if flag: bad += 1
         print(f"{name:14}{T:>6}{H:>5}{plen+elen:>9}{r['nonfinite']:>8}"
               f"{r['paged_vs_flat']:>15.3e}{str(r['exact']):>7}{r['paged_vs_triton']:>17.3e}"
               f"{r['flat_vs_triton']:>16.3e}{r['paged_vs_triton_deq']:>16.3e}{flag}", flush=True)
-    print("\nFAILURES:" if bad else "\nall cases: paged reads the pool exactly as flat does", bad or "")
+    print("\nFAILURES:" if bad else "\nall cases within 2e-3 of the flat arm against Triton", bad or "")
 
 
 if __name__ == "__main__":

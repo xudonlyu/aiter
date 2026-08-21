@@ -354,8 +354,14 @@ def pa_sparse_prefill_fp8_opus_paged(
     frame to keep in step.
 
     Args:
-      q_nope:            ``[N, H, 512]`` fp8, pre-packed (448 NoPE + 14 per-32
-        E8M0 + pad), exactly as the flat op wants it.
+      q_nope:            ``[N, H, 448]`` **bf16** -- the kernel packs it in its
+        prologue, one E8M0 per head, so there is no separate pack pass.  A
+        standalone pack runs at bandwidth (33 us at T=1024 H=128, 279 us at
+        T=8192) and cannot be tuned, so the only way to remove it is not to
+        materialise a packed Q at all.  Per head rather than per 32 because the
+        MFMA's E8M0 scale partition is not lane-local; the byte is replicated
+        into all four slots of the scale dword so ``op_sel`` picks the same
+        value whatever it selects.
       q_rope:            ``[N, H, 64]`` bf16.
       unified_kv_nope:   ``[rows, 512]`` fp8 view of the prefix pool, row stride
         576.  Its last 64 columns overlap the row's RoPE half and are never
@@ -384,10 +390,13 @@ def pa_sparse_prefill_fp8_opus_paged(
         raise RuntimeError(
             f"pa_sparse_prefill_fp8_opus_paged requires gfx950, got {gfx}"
         )
-    if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
+    # Q is bf16 and the KV streams are fp8; the dtypes deliberately differ.
+    if q_nope.dtype != torch.bfloat16:
+        raise RuntimeError(f"q_nope must be bf16 [N, H, 448], got {q_nope.dtype}")
+    if unified_kv_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
-            f"NoPE dtype mismatch: q_nope={q_nope.dtype}, "
-            f"unified_kv_nope={unified_kv_nope.dtype}, kv_nope={kv_nope.dtype}"
+            "unified_kv_nope/kv_nope dtype mismatch: "
+            f"{unified_kv_nope.dtype}, {kv_nope.dtype}"
         )
     if q_rope.dtype != torch.bfloat16:
         raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
