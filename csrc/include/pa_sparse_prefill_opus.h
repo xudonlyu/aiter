@@ -162,7 +162,7 @@ struct pa_fp8_page_grid
 //    carries 7 per-64 ones.
 struct pa_fp8_paged_kargs
 {
-    const void* __restrict__ q_nope_ptr;          // [N, H, D_NOPE_SIZE] bf16
+    const void* __restrict__ q_nope_ptr;          // [N, H, 512] fp8 until FUSED_Q
     const void* __restrict__ q_rope_ptr;          // [N, H, D_ROPE]      bf16
     const void* __restrict__ unified_kv_nope_ptr; // paged byte grid, NoPE at row+0
     const void* __restrict__ unified_kv_rope_ptr; // same grid, RoPE at row+448
@@ -468,7 +468,10 @@ struct pa_16mx8_32nx1_fp8_paged_traits
     using base = pa_16mx8_32nx1_fp8_traits<Q_TILE_SIZE_, KV_TILE_SIZE_, NUM_WARPS_, D_NOPE_, D_ROPE_, D_OUT_>;
 
     static constexpr bool PAGED   = true;
-    static constexpr bool FUSED_Q = true;
+    // Not yet: Q still arrives pre-packed fp8, exactly as the flat kernel wants
+    // it, so the paged KV read can be validated on its own before the in-kernel
+    // pack changes what Q means.
+    static constexpr bool FUSED_Q = false;
 
     // One 8-byte E8M0 slot per KV row of the tile: 7 per-64 exponents + 1 pad.
     static constexpr int SGL_SCALE_SLOT  = 8;
@@ -582,6 +585,8 @@ template <class Traits>
 __global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs);
 template <class Traits>
 __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
+template <class Traits>
+__global__ void pa_prefill_16mx8_32nx1_fp8_paged_kernel(pa_fp8_paged_kargs kargs);
 
 // Pull in the device kernel template bodies only on the gfx950 device pass.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
@@ -599,6 +604,10 @@ __global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs)
 }
 template <class Traits>
 __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs)
+{
+}
+template <class Traits>
+__global__ void pa_prefill_16mx8_32nx1_fp8_paged_kernel(pa_fp8_paged_kargs)
 {
 }
 #else
@@ -3931,8 +3940,11 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
 } // namespace pa_16mx8_32nx1_fp8
 
 
-template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs) {
+// Shared kernel body.  The flat and paged entries differ only in their kargs
+// type and, once the Q pack lands, in the Q prologue -- everything else is one
+// copy so a fix cannot land in only one of them.
+template<class Traits, class KArgs>
+__device__ inline void pa_prefill_16mx8_32nx1_fp8_body(KArgs kargs) {
     using namespace opus;
     using namespace pa_16mx8_32nx1_fp8;
     using T = opus::remove_cvref_t<Traits>;
@@ -3971,7 +3983,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     auto u_q_rope = make_layout_q_rope<T>(warp_id, lane_id);
     auto v_q_rope = load<T::VEC_Q_ROPE>(g_q_rope, u_q_rope);
 
-    __shared__ char smem_kv[4 * T::smem_kv_bytes()];
+    __shared__ char smem_kv[T::smem_size_bytes()];
+
 
     constexpr D_ACC LOG2_E = 1.44269504089f;
     const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
@@ -4073,6 +4086,22 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
     auto v_o_out = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_out, u_o);
+}
+
+template<class Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs) {
+    using T = opus::remove_cvref_t<Traits>;
+    pa_prefill_16mx8_32nx1_fp8_body<Traits>(kargs);
+}
+
+// Paged entry: the KV streams are vLLM's fp8_ds_mla page grid rather than a
+// flat [rows, 512] array, and the per-token E8M0 exponents come from each
+// page's scale tail.  Its LDS is larger by the double-buffered scale region.
+template<class Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_fp8_paged_kernel(pa_fp8_paged_kargs kargs) {
+    using T = opus::remove_cvref_t<Traits>;
+    static_assert(T::PAGED, "the paged entry needs a traits with PAGED = true");
+    pa_prefill_16mx8_32nx1_fp8_body<Traits>(kargs);
 }
 
 // =============================================================================
