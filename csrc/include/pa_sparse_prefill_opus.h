@@ -133,6 +133,72 @@ struct pa_fp8_kargs
     float softmax_scale;
 };
 
+// One KV segment's page geometry, passed by value into the shared pipeline.
+// The prefix and extend segments are the same 576-byte row grid with the same
+// per-64 UE8M0 page-tail scales and differ only in page size, which is why the
+// row strides stay in kargs and only these three travel per segment.
+struct pa_fp8_page_grid
+{
+    int page_shift;    // page_size == 1 << page_shift
+    int rows_per_page; // bytes_per_page / stride_kv_nope_page
+    int scale_off;     // byte offset of the page's scale tail
+};
+
+// Kernel arguments for the paged / fused-Q variant of the split-precision DSA
+// prefill.  Deliberately a separate struct rather than extra fields on
+// `pa_fp8_kargs`: the flat kernel above is shipped upstream and must keep its
+// exact argument layout, and the prebuilt code object mirrors this struct
+// field-for-field with offsetof asserts.
+//
+// Two things differ from `pa_fp8_kargs`:
+//
+//  * `q_nope_ptr` is **bf16 [N, H, 448]**, not pre-packed fp8 [N, H, 512].  The
+//    kernel quantises it in its prologue, one E8M0 per head.
+//  * the KV streams are addressed through a page grid, and the per-token E8M0
+//    scales live out of line in each page's tail rather than inside the row.
+//    `page_shift == 0` is rejected by the launcher -- unlike the h40 kernel,
+//    the flat layout is *not* a degenerate parameterisation of this one,
+//    because flat rows carry 14 per-32 exponents inline while a page tail
+//    carries 7 per-64 ones.
+struct pa_fp8_paged_kargs
+{
+    const void* __restrict__ q_nope_ptr;          // [N, H, D_NOPE_SIZE] bf16
+    const void* __restrict__ q_rope_ptr;          // [N, H, D_ROPE]      bf16
+    const void* __restrict__ unified_kv_nope_ptr; // paged byte grid, NoPE at row+0
+    const void* __restrict__ unified_kv_rope_ptr; // same grid, RoPE at row+448
+    const void* __restrict__ kv_nope_ptr;         // extend segment, same shape
+    const void* __restrict__ kv_rope_ptr;
+    const void* __restrict__ attn_sink_ptr;       // [H]
+    void* __restrict__ out_ptr;                   // [N, H, D_HEAD] bf16
+    const int* __restrict__ kv_indptr_prefix;     // [N+1], or null for the dense form
+    const int* __restrict__ kv_indices_prefix;
+    const int* __restrict__ kv_indptr_extend;
+    const int* __restrict__ kv_indices_extend;
+    const int* __restrict__ kv_lens_prefix;       // [N], dense form only
+    const int* __restrict__ kv_lens_extend;
+    int N;
+    int H;
+    int total_pages;
+    int total_tokens;
+    int stride_q_nope_n;
+    int stride_q_nope_h;
+    int stride_q_rope_n;
+    int stride_q_rope_h;
+    int stride_o_n;
+    int stride_o_h;
+    int stride_kv_nope_page;   // bytes per KV row (576 for the DSv4 pool)
+    int stride_kv_rope_page;   // bf16 elements per KV row (288 for the DSv4 pool)
+    int kv_stride_q_prefix;    // dense form: row stride of the [N, topk] index array
+    int kv_stride_q_extend;
+    // Page grid descriptor, [0] = prefix / unified, [1] = extend.  Page p's
+    // token j is grid row p*rows_per_page + j, and its E8M0 slot is at
+    // p*rows_per_page*stride_kv_nope_page + scale_off + j*8.
+    int page_shift[2];
+    int rows_per_page[2];
+    int scale_off[2];
+    float softmax_scale;
+};
+
 // Compile-time tile/MFMA configuration for the 16mx8_32nx1 variant (T_M=NUM_WARPS,
 // T_N=1). Used when H > 32. KV_TILE=32, NUM_WARPS=8, BLOCK_SIZE=512.
 template <int Q_TILE_SIZE_  = 16,
@@ -362,6 +428,67 @@ struct pa_16mx8_32nx1_fp8_traits
     static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
     static constexpr int k_rope_ds_read_insts = (GEMM0_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_KV_ROPE);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V);
+
+    // KV rows are a flat [rows, D_NOPE_PADDED] array whose 14 per-32 E8M0
+    // exponents ride inside the row, and Q arrives pre-packed.  The paged
+    // variant below flips both.  Declared here so the shared pipeline can use
+    // `if constexpr (T::PAGED)` without a second traits concept.
+    static constexpr bool PAGED   = false;
+    static constexpr bool FUSED_Q = false;
+    static constexpr int  SCALE_SLOT_BYTES = 0;
+};
+
+// Compile-time tile/MFMA configuration for the *paged* split-precision
+// 16mx8_32nx1 fp8 variant -- same MFMA shape and the same pipeline, but the KV
+// rows are addressed through a page grid and the E8M0 exponents come from each
+// page's out-of-line scale tail rather than from inside the row.
+//
+// Two knobs move as a result:
+//
+//   kv_buffer_load_insts  one more async global->LDS copy per tile, for the
+//                         8-byte scale slot.  Every `s_waitcnt vmcnt` in the
+//                         pipeline is expressed in terms of this constant, so
+//                         bumping it here is what keeps the accounting right.
+//   smem_size_bytes       an extra scale region, double-buffered alongside K.
+//
+// The scale region is separate from the KV tile rather than being patched into
+// the row's padded columns [448, 512): those columns are written by the row
+// copy itself, and two async copies landing on the same LDS bytes have no
+// defined order.
+template <int Q_TILE_SIZE_  = 16,
+          int KV_TILE_SIZE_ = 32,
+          int NUM_WARPS_    = 8,
+          typename D_NOPE_  = fp8_t,
+          typename D_ROPE_  = bf16_t,
+          typename D_OUT_   = bf16_t>
+struct pa_16mx8_32nx1_fp8_paged_traits
+    : pa_16mx8_32nx1_fp8_traits<Q_TILE_SIZE_, KV_TILE_SIZE_, NUM_WARPS_, D_NOPE_, D_ROPE_, D_OUT_>
+{
+    using base = pa_16mx8_32nx1_fp8_traits<Q_TILE_SIZE_, KV_TILE_SIZE_, NUM_WARPS_, D_NOPE_, D_ROPE_, D_OUT_>;
+
+    static constexpr bool PAGED   = true;
+    static constexpr bool FUSED_Q = true;
+
+    // One 8-byte E8M0 slot per KV row of the tile: 7 per-64 exponents + 1 pad.
+    static constexpr int SGL_SCALE_SLOT  = 8;
+    static constexpr int SCALE_SLOT_BYTES = KV_TILE_SIZE_ * SGL_SCALE_SLOT;
+
+    // Bytes of a KV row that actually hold NoPE fp8.  The paged row is 576 B
+    // (448 NoPE + 128 RoPE), so unlike the flat 512 B row there is nothing
+    // useful in [448, 512) -- but reading it is still in bounds, and the
+    // pipeline already scrubs those columns out of both the score operand
+    // (clear(k_blk[1]/[3])) and the scale operand (v_mxscl[3]/[7] = 0 for
+    // lane >= 32).  So the row copy is left at its full width and only the
+    // scale source moves.
+    static constexpr int SGL_ROW_BYTES = 576;
+    static constexpr int SGL_NSCALE    = 7;
+
+    static constexpr int kv_buffer_load_insts = base::kv_buffer_load_insts + 1;
+
+    static constexpr size_t smem_size_bytes()
+    {
+        return 4 * base::smem_kv_bytes() + 2 * (size_t)SCALE_SLOT_BYTES;
+    }
 };
 
 // Compile-time tile/MFMA configuration for the split-precision 16mx1_16nx4 fp8
@@ -2676,9 +2803,9 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
     });
 }
 
-template<class Traits, class VQN, class VQR, class VO>
+template<class Traits, int SEG, class KArgs, class VQN, class VQR, class VO>
 __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+        KArgs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
@@ -2759,8 +2886,36 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 
     // Tile traversal helpers
     auto load_kv_page   = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_nope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_nope_page; };
-    auto kv_rope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_rope_page; };
+    // Token id -> flat grid row.  Under PAGED the pool is a uniform
+    // stride_kv_nope_page grid in which page p's token j is grid row
+    // p*rows_per_page + j.  Each factor is widened *before* the multiply:
+    // rows_per_page is ~330 and the row stride 576, so the int product with a
+    // page index wraps inside a real DSv4 pool.
+    // The page descriptor is read here rather than passed in: a by-value
+    // parameter stays live into the flat instantiation and perturbs its address
+    // arithmetic, while a local the optimizer can prove constant does not.
+    pa_fp8_page_grid grid{0, 1, 0};
+    if constexpr (T::PAGED) {
+        grid = {kargs.page_shift[SEG], kargs.rows_per_page[SEG], kargs.scale_off[SEG]};
+    }
+    auto grid_row = [&](int token_idx) -> int64_t {
+        const int mask = (1 << grid.page_shift) - 1;
+        return static_cast<int64_t>(token_idx >> grid.page_shift)
+                   * static_cast<int64_t>(grid.rows_per_page)
+             + static_cast<int64_t>(token_idx & mask);
+    };
+    // The flat branch keeps the original expression verbatim rather than
+    // routing through grid_row: writing it as `grid_row(t) * stride` is
+    // semantically identical but lets the compiler pick a different 64-bit
+    // multiply expansion, and the flat kernel is shipped upstream.
+    auto kv_nope_offset = [&](int token_idx) -> int64_t {
+        if constexpr (!T::PAGED) return static_cast<int64_t>(token_idx) * kargs.stride_kv_nope_page;
+        else                     return grid_row(token_idx) * kargs.stride_kv_nope_page;
+    };
+    auto kv_rope_offset = [&](int token_idx) -> int64_t {
+        if constexpr (!T::PAGED) return static_cast<int64_t>(token_idx) * kargs.stride_kv_rope_page;
+        else                     return grid_row(token_idx) * kargs.stride_kv_rope_page;
+    };
 
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q, auto& v_k_mxscl) {
         clear(s);
@@ -2875,9 +3030,9 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
     }
 }
 
-template<class Traits, bool OddTail, class VQN, class VQR, class VO>
+template<class Traits, bool OddTail, int SEG, class KArgs, class VQN, class VQR, class VO>
 __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+        KArgs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
@@ -2973,8 +3128,36 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     // Tile traversal helpers
     int kv_page[2];
     auto load_kv_page   = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_nope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_nope_page; };
-    auto kv_rope_offset = [&](int token_idx) { return static_cast<int64_t>(token_idx) * kargs.stride_kv_rope_page; };
+    // Token id -> flat grid row.  Under PAGED the pool is a uniform
+    // stride_kv_nope_page grid in which page p's token j is grid row
+    // p*rows_per_page + j.  Each factor is widened *before* the multiply:
+    // rows_per_page is ~330 and the row stride 576, so the int product with a
+    // page index wraps inside a real DSv4 pool.
+    // The page descriptor is read here rather than passed in: a by-value
+    // parameter stays live into the flat instantiation and perturbs its address
+    // arithmetic, while a local the optimizer can prove constant does not.
+    pa_fp8_page_grid grid{0, 1, 0};
+    if constexpr (T::PAGED) {
+        grid = {kargs.page_shift[SEG], kargs.rows_per_page[SEG], kargs.scale_off[SEG]};
+    }
+    auto grid_row = [&](int token_idx) -> int64_t {
+        const int mask = (1 << grid.page_shift) - 1;
+        return static_cast<int64_t>(token_idx >> grid.page_shift)
+                   * static_cast<int64_t>(grid.rows_per_page)
+             + static_cast<int64_t>(token_idx & mask);
+    };
+    // The flat branch keeps the original expression verbatim rather than
+    // routing through grid_row: writing it as `grid_row(t) * stride` is
+    // semantically identical but lets the compiler pick a different 64-bit
+    // multiply expansion, and the flat kernel is shipped upstream.
+    auto kv_nope_offset = [&](int token_idx) -> int64_t {
+        if constexpr (!T::PAGED) return static_cast<int64_t>(token_idx) * kargs.stride_kv_nope_page;
+        else                     return grid_row(token_idx) * kargs.stride_kv_nope_page;
+    };
+    auto kv_rope_offset = [&](int token_idx) -> int64_t {
+        if constexpr (!T::PAGED) return static_cast<int64_t>(token_idx) * kargs.stride_kv_rope_page;
+        else                     return grid_row(token_idx) * kargs.stride_kv_rope_page;
+    };
 
     auto async_load_kv = [&](auto slot_n, int token_idx) {
         constexpr int sl = decltype(slot_n)::value;
@@ -3623,6 +3806,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
+    // Page geometry per segment: [0] prefix / unified, [1] extend.  The flat
+    // kernel has no such fields and never reads the result -- `grid_row` is
+    // `if constexpr`-disabled there, so this folds away.
+
     // ──── Prefix segment ────
     {
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
@@ -3631,7 +3818,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
+            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits, 0>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3639,7 +3826,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true, 0>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3647,7 +3834,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false, 0>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3666,7 +3853,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
+            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits, 1>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3674,7 +3861,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true, 1>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3682,7 +3869,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false, 1>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
