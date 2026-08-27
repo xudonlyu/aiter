@@ -262,8 +262,215 @@ def pa_sparse_prefill_fp8_opus(
     return out
 
 
+def _empty_i32(like: torch.Tensor) -> torch.Tensor:
+    """Sentinel for an omitted optional tensor argument (numel 0 == not given)."""
+    return torch.empty(0, dtype=torch.int32, device=like.device)
+
+
+@compile_ops("module_pa_sparse_prefill_opus", develop=True)
+def pa_sparse_prefill_fp8_opus_paged_fwd(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    page_shift_prefix: int,
+    rows_per_page_prefix: int,
+    scale_off_prefix: int,
+    page_shift_extend: int,
+    rows_per_page_extend: int,
+    scale_off_extend: int,
+    kv_lens_prefix: torch.Tensor,
+    kv_lens_extend: torch.Tensor,
+    kv_stride_q_prefix: int,
+    kv_stride_q_extend: int,
+) -> None: ...
+
+
+def _pa_sparse_prefill_fp8_opus_paged_fake(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    page_shift_prefix: int,
+    rows_per_page_prefix: int,
+    scale_off_prefix: int,
+    page_shift_extend: int,
+    rows_per_page_extend: int,
+    scale_off_extend: int,
+    out: torch.Tensor | None = None,
+    kv_lens_prefix: torch.Tensor | None = None,
+    kv_lens_extend: torch.Tensor | None = None,
+    kv_stride_q_prefix: int = 0,
+    kv_stride_q_extend: int = 0,
+) -> torch.Tensor:
+    if out is not None:
+        return out
+    t, h, _ = q_nope.shape
+    return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q_nope.device)
+
+
+@torch_compile_guard(
+    mutates_args=["out"], gen_fake=_pa_sparse_prefill_fp8_opus_paged_fake
+)
+def pa_sparse_prefill_fp8_opus_paged(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    page_shift_prefix: int,
+    rows_per_page_prefix: int,
+    scale_off_prefix: int,
+    page_shift_extend: int,
+    rows_per_page_extend: int,
+    scale_off_extend: int,
+    out: torch.Tensor | None = None,
+    kv_lens_prefix: torch.Tensor | None = None,
+    kv_lens_extend: torch.Tensor | None = None,
+    kv_stride_q_prefix: int = 0,
+    kv_stride_q_extend: int = 0,
+) -> torch.Tensor:
+    """Sparse prefill attention reading vLLM's ``fp8_ds_mla`` paged pool directly.
+
+    Same kernel and same numerics as :func:`pa_sparse_prefill_fp8_opus`, but the
+    KV streams are addressed by slot index inside a page grid instead of being
+    staged into a flat array first -- which is the whole point: it removes the
+    dequantise-and-gather pass that would otherwise run over the pool on every
+    call.
+
+    A pool row is 576 B, 448 NoPE fp8 followed by 64 RoPE bf16, and the
+    exponents are **not** in the row: every page ends with a tail of 8 B per
+    token holding 7 per-64 UE8M0 block scales and a pad byte.  A per-64 exponent
+    applies exactly to both of its per-32 halves, with the identical ``exp+127``
+    encoding, so the kernel consumes the pool's scales unchanged -- there is no
+    requantisation, no in-place rewrite of the cache, and no global exponent
+    frame to keep in step.
+
+    Args:
+      q_nope:            ``[N, H, 448]`` **bf16** -- the kernel packs it in its
+        prologue, one E8M0 per head, so there is no separate pack pass.  Only
+        the head dim has to be unit-stride, so a ``[..., :448]`` slice of a
+        wider Q needs no copy.  A
+        standalone pack runs at bandwidth (33 us at T=1024 H=128, 279 us at
+        T=8192) and cannot be tuned, so the only way to remove it is not to
+        materialise a packed Q at all.  Per head rather than per 32 because the
+        MFMA's E8M0 scale partition is not lane-local; the byte is replicated
+        into all four slots of the scale dword so ``op_sel`` picks the same
+        value whatever it selects.
+      q_rope:            ``[N, H, 64]`` bf16.
+      unified_kv_nope:   ``[rows, 512]`` fp8 view of the prefix pool, row stride
+        576.  Its last 64 columns overlap the row's RoPE half and are never
+        used, so a plain strided view of the pool is what to pass.
+      unified_kv_rope:   ``[rows, 64]`` bf16 view of the same pool, based at
+        byte 448 of row 0, row stride 288.
+      kv_nope, kv_rope:  the extend segment's views, same shapes and strides.
+      kv_indices_*:      ``[nnz]`` int32 slot ids, concatenated per token.
+      kv_indptr_*:       ``[N+1]`` int32 CSR row pointers.
+      attn_sink:         ``[H]`` fp32 per-head softmax-denominator bias.
+      page_shift_*:      ``page_size == 1 << page_shift``.
+      rows_per_page_*:   ``bytes_per_page / 576``.
+      scale_off_*:       byte offset of the page's scale tail.
+      out:               optional ``[N, H, 512]`` bf16 buffer.
+      kv_lens_*:         optional ``[N]`` int32 per-token lengths.  Supplying
+        them selects the **dense** index form -- ``kv_indices_*`` is then read as
+        a ``[N, kv_stride_q_*]`` array and ``kv_indptr_*`` is ignored -- which is
+        the shape vLLM already has, so no CSR has to be built per call.  Both
+        segments must use the same form.
+      kv_stride_q_*:     row stride of the dense index array.
+
+    The prefix and extend segments may live in different pools with different
+    page sizes, hence one descriptor each.
+
+    Requires ``H > 32``: only the T_M=8 pipeline has a paged variant.  There is
+    also no flat fallback -- ``page_shift == 0`` is rejected rather than treated
+    as a degenerate page grid, because a flat row carries 14 per-32 exponents
+    inline and this kernel always fetches 7 per-64 ones from a page tail.
+    """
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        raise RuntimeError(
+            f"pa_sparse_prefill_fp8_opus_paged requires gfx950, got {gfx}"
+        )
+    # Q is bf16 and the KV streams are fp8; the dtypes deliberately differ.
+    if q_nope.dtype != torch.bfloat16:
+        raise RuntimeError(f"q_nope must be bf16 [N, H, 448], got {q_nope.dtype}")
+    if unified_kv_nope.dtype != kv_nope.dtype:
+        raise RuntimeError(
+            "unified_kv_nope/kv_nope dtype mismatch: "
+            f"{unified_kv_nope.dtype}, {kv_nope.dtype}"
+        )
+    if q_rope.dtype != torch.bfloat16:
+        raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
+
+    t, h = q_nope.shape[0], q_nope.shape[1]
+    if h <= 32:
+        raise RuntimeError(
+            f"pa_sparse_prefill_fp8_opus_paged is only compiled for H > 32, got H={h}"
+        )
+    if out is None:
+        out = torch.empty((t, h, 512), dtype=torch.bfloat16, device=q_nope.device)
+    elif out.shape != (t, h, 512) or out.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"out shape/dtype mismatch: got shape={tuple(out.shape)} dtype={out.dtype}, "
+            f"expected shape={(t, h, 512)} dtype={torch.bfloat16}"
+        )
+
+    pa_sparse_prefill_fp8_opus_paged_fwd(
+        q_nope,
+        q_rope,
+        unified_kv_nope,
+        unified_kv_rope,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv_nope,
+        kv_rope,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        out,
+        float(softmax_scale),
+        int(page_shift_prefix),
+        int(rows_per_page_prefix),
+        int(scale_off_prefix),
+        int(page_shift_extend),
+        int(rows_per_page_extend),
+        int(scale_off_extend),
+        _empty_i32(q_nope) if kv_lens_prefix is None else kv_lens_prefix,
+        _empty_i32(q_nope) if kv_lens_extend is None else kv_lens_extend,
+        int(kv_stride_q_prefix),
+        int(kv_stride_q_extend),
+    )
+    return out
+
+
 __all__ = [
     "pa_sparse_prefill_fp8_opus",
+    "pa_sparse_prefill_fp8_opus_paged",
+    "pa_sparse_prefill_fp8_opus_paged_fwd",
     "pa_sparse_prefill_fp8_opus_fwd",
     "pa_sparse_prefill_opus",
     "pa_sparse_prefill_opus_fwd",
